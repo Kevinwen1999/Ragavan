@@ -18,9 +18,12 @@ LLM_ENDPOINT = 'http://localhost:1234/v1/chat/completions'
 MESSAGE_HISTORY_FILE = 'user_message_histories.json'
 
 # Maximum number of tokens to maintain for context (you can adjust based on your model's limits)
-MAX_TOKENS = 7000  # Adjust according to the model’s total token limit
+MAX_TOKENS = 4000  # Adjust according to the model’s total token limit
 MAX_MESSAGES_HISTORY = 100  # Max number of messages to keep in history
 
+# system_prompt = "Always answers in Chinese. Chinese is Mandatory."
+
+# tokenizer used to calculate token count
 tokenizer = tiktoken.encoding_for_model("gpt-3.5-turbo")
 
 # Set the bot's intents (permissions)
@@ -92,7 +95,8 @@ async def inject_user_chat_history(message, target_user, limit=50):
 
     async for msg in message.channel.history(limit=limit):
         if msg.author == target_user:  # Only include messages from the target user
-            injected_messages.append(msg.content)
+            if msg.content.startswith("!") == False:
+                injected_messages.append(msg.content)
 
     if not injected_messages:
         await message.channel.send(f"No messages found for {target_user.name}.")
@@ -155,24 +159,29 @@ async def analyze_user(message, target_user_id):
             await message.channel.send(f"An error occurred: {str(e)}")
 
 # Function to generate a response imitating the user's style
-async def imitate_user_style(message, target_user_id):
-    # Collect the last N messages from the user to use as examples
+async def imitate_user_style(message, target_user, sentence=None):
+    target_user_id = str(target_user.id)
+    # Collect the user's messages and trim to fit under the MAX_TOKENS limit
     user_messages = user_message_histories.get(target_user_id, [])
 
     if not user_messages or len(user_messages) < 1:
         await message.channel.send("Not enough messages to imitate this user's style.")
         return
 
-
     # Trim messages to fit within MAX_TOKENS
     trimmed_messages = trim_messages_to_fit(user_messages, MAX_TOKENS)
 
     # Craft the prompt to imitate the target user's style
-    prompt = "Generate one sentence by imitating the following user's style of speech. Here are some of their recent messages:\n\n"
-    for user_message in trimmed_messages:  # Use the last 5 messages as examples
+    if sentence:
+        prompt = f"Based on the following user's style, generate a sentence that mimics their tone while saying the following sentence: '{sentence}'.\n\n The following are some of their recent messages:\n\n"
+    else:
+        prompt = "Generate one sentence by imitating the following user's style of speech. Here are some of their recent messages::\n\n"
+    
+    for user_message in trimmed_messages:
         prompt += f"- {user_message}\n"
 
-    prompt += "\nGenerate one sentence that imitates this user's style of speech."
+    if not sentence:
+        prompt += "\nGenerate one sentence that imitates this user's style of speech."
 
     payload = {
         "messages": [{"role": "user", "content": prompt}]
@@ -291,13 +300,18 @@ async def on_message(message):
 
     # Command to imitate another user's style
     if message.content.startswith('!imitate'):
-        # Extract the mentioned user from the message
+        # Extract the mentioned user from the message and the optional sentence
         if message.mentions:
             target_user = message.mentions[0]
-            target_user_id = str(target_user.id)
-            await imitate_user_style(message, target_user_id)
+            try:
+                # Extract the sentence after the mention
+                sentence = message.content.split(' ', 2)[2] if len(message.content.split()) > 2 else None
+            except IndexError:
+                sentence = None
+
+            await imitate_user_style(message, target_user, sentence=sentence)
         else:
-            await message.channel.send("Please mention a user to imitate. Usage: `!imitate @user_name`")
+            await message.channel.send("Please mention a user to imitate. Usage: `!imitate @user_name [optional sentence]`")
         return
 
     # If the user sends the reset command, clear their conversation history
@@ -361,12 +375,13 @@ async def on_message(message):
         - `!regenerate`: Regenerate the bot's response to the last question.
         - `!reset`: Reset the conversation and start fresh.
         - `!inject @user_name <limit>`: Inject a user’s chat history (up to <limit> messages) from this channel into their message history.
-        - `!imitate @user_name`: Imitate the style of the mentioned user based on their past messages.
+        - `!imitate @user_name [optional sentence]`: Imitate the style of the mentioned user based on their past messages, with an optional sentence to mimic their style.
         - `!analyze @user_name`: Do a personality and sentiment analysis of the mentioned user based on their past messages.
         - `!help`: Show this help message.
         """
         await message.channel.send(help_message)
         return
+    
     # Collect the user's message for imitation purposes
     collect_user_message(user_id, message.content)
 
