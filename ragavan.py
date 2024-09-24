@@ -3,9 +3,13 @@ import discord
 import aiohttp
 import json
 import tiktoken
+from dotenv import load_dotenv
 
-# Load your bot token
-TOKEN = ''
+# Load the environment variables from .env file
+load_dotenv()
+
+# Get the Discord bot token from .env
+TOKEN = os.getenv('DISCORD_BOT_TOKEN')
 
 # LLM API endpoint
 LLM_ENDPOINT = 'http://localhost:1234/v1/chat/completions'
