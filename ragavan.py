@@ -2,8 +2,10 @@ import os
 import discord
 import aiohttp
 import json
+import requests
 import tiktoken
 from dotenv import load_dotenv
+from duckduckgo_search import DDGS
 
 # Load the environment variables from .env file
 load_dotenv()
@@ -20,6 +22,9 @@ MESSAGE_HISTORY_FILE = 'user_message_histories.json'
 # Maximum number of tokens to maintain for context (you can adjust based on your model's limits)
 MAX_TOKENS = 4000  # Adjust according to the model’s total token limit
 MAX_MESSAGES_HISTORY = 100  # Max number of messages to keep in history
+
+# DuckDuckGo Instant Answer API URL
+DUCKDUCKGO_API_URL = "http://api.duckduckgo.com/"
 
 # system_prompt = "Always answers in Chinese. Chinese is Mandatory."
 
@@ -254,6 +259,70 @@ async def generate_response(message, user_id, continue_generation=False):
         except Exception as e:
             await message.channel.send(f"An error occurred: {str(e)}")
 
+
+
+# Function to perform a search using duckduckgo-search package
+def perform_search_duckduckgo(query):
+    # Perform the DuckDuckGo search
+    results = DDGS().text(keywords=query, max_results=5)  # Limit results to top 5
+    return results if results else []
+
+# Function to format search results for LLM
+def format_search_results_duckduckgo(results):
+    formatted = ""
+    for result in results:  # Limit to top 3 results
+        formatted += f"Title: {result['title']}\n"
+        formatted += f"Snippet: {result['body']}\n"
+        formatted += f"Link: {result['href']}\n\n"
+    return formatted
+
+# Function to generate a response combining search results and user query
+async def generate_response_with_search(message, user_id, search_results):
+
+    user_query = conversation_histories[user_id]
+
+    # Combine the user's question with the search results
+    prompt = f"User asked: {user_query}\n\nHere is some information from a web search:\n"
+    prompt += search_results
+    prompt += "\nPlease generate a response based on the user's question and the search results."
+
+    payload = {
+        "messages": [{"role": "user", "content": prompt}]
+    }
+
+    async with message.channel.typing():
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(LLM_ENDPOINT, json=payload) as response:
+                    if response.status == 200:
+                        result = await response.json()
+
+                        # Extract the LLM response
+                        try:
+                            bot_response = result['choices'][0]['message']['content']
+                        except (KeyError, IndexError):
+                            bot_response = 'Sorry, I didn’t understand that.'
+
+                        # Split and send the response if it's longer than 2000 characters
+                        messages_to_send = split_message(bot_response)
+
+                        # Add the bot's response to the conversation history
+                        conversation_histories[user_id].append({
+                            "role": "assistant",
+                            "content": bot_response
+                        })
+
+                        for chunk in messages_to_send:
+                            await message.channel.send(chunk)
+                    else:
+                        await message.channel.send('Failed to reach the LLM endpoint.')
+        except Exception as e:
+            await message.channel.send(f"An error occurred: {str(e)}")
+
+
+#--------------------------------------------------------------EVENTS----------------------------------------------------------------------------------
+
+
 @client.event
 async def on_ready():
     print(f'We have logged in as {client.user}')
@@ -366,11 +435,44 @@ async def on_message(message):
         # Generate the response
         await generate_response(message, user_id)
 
+     # Handle the !asknet command
+    if message.content.startswith('!net'):
+        user_input = message.content[len('!net '):]
+
+        # Add the new user message to the conversation history
+        conversation_histories[user_id].append({
+            "role": "user",
+            "content": user_input
+        })
+
+        # Store the last user input separately for the regenerate and continue commands
+        last_user_inputs[user_id] = user_input
+
+        # Trim the conversation history to fit within the token limit
+        conversation_histories[user_id] = trim_conversation_history(conversation_histories[user_id], MAX_TOKENS)
+
+        # Perform a web search using DuckDuckGo
+        search_results = perform_search_duckduckgo(user_input)
+
+        # Format the search results for the LLM
+        formatted_results = format_search_results_duckduckgo(search_results)
+
+        print(formatted_results)
+
+        if not formatted_results:
+            await message.channel.send("Sorry, I couldn't find any relevant results.")
+            return
+
+        # Generate a response combining the user's query and the search results
+        await generate_response_with_search(message, user_id, formatted_results)
+        return
+
     # Handle the help command
     if message.content.startswith('!help'):
         help_message = """
         **Available Commands:**
         - `!ask <your question>`: Ask the bot a question.
+        - `!net <your question>`: Ask the bot a question using web search to provide context.
         - `!continue`: Continue the last response based on previous input.
         - `!regenerate`: Regenerate the bot's response to the last question.
         - `!reset`: Reset the conversation and start fresh.
