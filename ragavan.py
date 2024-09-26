@@ -6,6 +6,7 @@ import requests
 import tiktoken
 from dotenv import load_dotenv
 from duckduckgo_search import DDGS
+from PyPDF2 import PdfReader
 
 # Load the environment variables from .env file
 load_dotenv()
@@ -20,7 +21,7 @@ LLM_ENDPOINT = 'http://localhost:1234/v1/chat/completions'
 MESSAGE_HISTORY_FILE = 'user_message_histories.json'
 
 # Maximum number of tokens to maintain for context (you can adjust based on your model's limits)
-MAX_TOKENS = 4000  # Adjust according to the model’s total token limit
+MAX_TOKENS = 7000  # Adjust according to the model’s total token limit
 MAX_MESSAGES_HISTORY = 100  # Max number of messages to keep in history
 
 # DuckDuckGo Instant Answer API URL
@@ -277,9 +278,7 @@ def format_search_results_duckduckgo(results):
     return formatted
 
 # Function to generate a response combining search results and user query
-async def generate_response_with_search(message, user_id, search_results):
-
-    user_query = conversation_histories[user_id]
+async def generate_response_with_search(message, user_id, search_results, user_query):
 
     # Combine the user's question with the search results
     prompt = f"User asked: {user_query}\n\nHere is some information from a web search:\n"
@@ -320,6 +319,65 @@ async def generate_response_with_search(message, user_id, search_results):
             await message.channel.send(f"An error occurred: {str(e)}")
 
 
+
+# Function to extract text from a PDF file
+def extract_text_from_pdf(file_bytes):
+    reader = PdfReader(file_bytes)
+    text = ""
+    for page in reader.pages:
+        text += page.extract_text()
+    return text
+
+# Function to process file content and send it to LLM
+async def process_file_content(message, user_id, file_content, user_query):
+
+
+    # Combine the user's question with the file content
+    prompt = f"User asked: {user_query}\n\nHere is some information from the attached file:\n{file_content}\n\n"
+    prompt += "Please generate a response based on the user's question and the file content."
+
+    payload = {
+        "messages": [{"role": "user", "content": prompt}]
+    }
+
+    # Add the payload to the conversation history
+    conversation_histories[user_id].append({
+        "role": "user",
+        "content": prompt
+    })
+
+    # Trim the conversation history to fit within the token limit
+    conversation_histories[user_id] = trim_conversation_history(conversation_histories[user_id], MAX_TOKENS)
+
+    async with message.channel.typing():
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(LLM_ENDPOINT, json=payload) as response:
+                    if response.status == 200:
+                        result = await response.json()
+
+                        # Extract the LLM response
+                        try:
+                            bot_response = result['choices'][0]['message']['content']
+                        except (KeyError, IndexError):
+                            bot_response = 'Sorry, I didn’t understand that.'
+
+                        # Add the bot's response to the conversation history
+                        conversation_histories[user_id].append({
+                            "role": "assistant",
+                            "content": bot_response
+                        })
+
+                         # Split and send the response if it's longer than 2000 characters
+                        messages_to_send = split_message(bot_response)
+                        
+                        # Send the response to the user
+                        for chunk in messages_to_send:
+                            await message.channel.send(chunk)
+                    else:
+                        await message.channel.send('Failed to reach the LLM endpoint.')
+        except Exception as e:
+            await message.channel.send(f"An error occurred: {str(e)}")
 #--------------------------------------------------------------EVENTS----------------------------------------------------------------------------------
 
 
@@ -464,7 +522,62 @@ async def on_message(message):
             return
 
         # Generate a response combining the user's query and the search results
-        await generate_response_with_search(message, user_id, formatted_results)
+        await generate_response_with_search(message, user_id, formatted_results, user_input)
+        return
+    
+    # Handle the !file command
+    if message.content.startswith('!file'):
+        user_input = message.content[len('!file '):]
+
+        # Add the new user message to the conversation history
+        conversation_histories[user_id].append({
+            "role": "user",
+            "content": user_input
+        })
+
+        # Store the last user input separately for the regenerate and continue commands
+        last_user_inputs[user_id] = user_input
+
+        # Trim the conversation history to fit within the token limit
+        conversation_histories[user_id] = trim_conversation_history(conversation_histories[user_id], MAX_TOKENS)
+
+        # Check if there is an attached file
+        if message.attachments:
+            attachment = message.attachments[0]  # Assuming only one file is attached
+
+            # Check if the attachment is a text file or PDF file
+            if attachment.filename.endswith('.txt'):
+                try:
+                    # Download the file content
+                    file_content = await attachment.read()
+                    file_text = file_content.decode('utf-8')
+
+                    # Process the file content along with the user's query
+                    await process_file_content(message, user_id, file_text, user_input)
+
+                except Exception as e:
+                    await message.channel.send(f"Failed to read the file: {str(e)}")
+            elif attachment.filename.endswith('.pdf'):
+                try:
+                    # Download the PDF file
+                    file_content = await attachment.read()
+
+                    # Use a memory buffer for the PDF data
+                    from io import BytesIO
+                    file_bytes = BytesIO(file_content)
+
+                    # Extract text from the PDF
+                    pdf_text = extract_text_from_pdf(file_bytes)
+
+                    # Process the PDF content along with the user's query
+                    await process_file_content(message, user_id, pdf_text, user_input)
+
+                except Exception as e:
+                    await message.channel.send(f"Failed to read the PDF file: {str(e)}")
+            else:
+                await message.channel.send("Only .txt and .pdf files are supported at this time.")
+        else:
+            await message.channel.send("Please attach a file to use the !file command.")
         return
 
     # Handle the help command
@@ -473,6 +586,7 @@ async def on_message(message):
         **Available Commands:**
         - `!ask <your question>`: Ask the bot a question.
         - `!net <your question>`: Ask the bot a question using web search to provide context.
+        - `!file <your question>`: Ask the bot a question using the content of an attached text file (.txt) or PDF file (.pdf) for context.
         - `!continue`: Continue the last response based on previous input.
         - `!regenerate`: Regenerate the bot's response to the last question.
         - `!reset`: Reset the conversation and start fresh.
