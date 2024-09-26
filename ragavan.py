@@ -264,13 +264,13 @@ async def generate_response(message, user_id, continue_generation=False):
 # Function to perform a search using duckduckgo-search package
 def perform_search_duckduckgo(query):
     # Perform the DuckDuckGo search
-    results = DDGS().text(keywords=query, max_results=5)  # Limit results to top 5
+    results = DDGS().text(keywords=query, max_results=10, safesearch="off")  # Limit results to top 10
     return results if results else []
 
 # Function to format search results for LLM
 def format_search_results_duckduckgo(results):
     formatted = ""
-    for result in results:  # Limit to top 3 results
+    for result in results:
         formatted += f"Title: {result['title']}\n"
         formatted += f"Snippet: {result['body']}\n"
         formatted += f"Link: {result['href']}\n\n"
