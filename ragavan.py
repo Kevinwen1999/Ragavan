@@ -323,6 +323,14 @@ async def generate_response_with_search(message, user_id, search_results, user_q
 # Function to extract text from a PDF file
 def extract_text_from_pdf(file_bytes):
     reader = PdfReader(file_bytes)
+
+    # Check if the PDF is encrypted
+    if reader.is_encrypted:
+        try:
+            reader.decrypt('')  # Attempt to decrypt with no password (empty string)
+        except Exception as e:
+            raise ValueError("The PDF is encrypted and requires a password.")
+    
     text = ""
     for page in reader.pages:
         text += page.extract_text()
