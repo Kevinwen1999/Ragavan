@@ -2,6 +2,7 @@ import io
 import queue
 import discord
 import asyncio
+import edge_tts
 import pyaudio
 import numpy as np
 from discord.ext import commands
@@ -10,6 +11,7 @@ from scipy.signal import resample
 from dotenv import load_dotenv
 import os
 import subprocess
+import yt_dlp
 
 # Experimental file for real time voice data processing, not very successful yet
 
@@ -79,7 +81,7 @@ async def test_audio(ctx):
     vc = ctx.voice_client
 
     # Ensure ffmpeg is available
-    source = discord.FFmpegPCMAudio('test.raw')
+    source = discord.FFmpegPCMAudio('tts_rvc_output.wav')
     vc.play(source)
 
 @bot.command()
@@ -102,6 +104,64 @@ async def play_test_audio(ctx):
     vc.play(discord.PCMAudio(audio_stream), after=lambda e: audio_stream.close())
 
     await ctx.send("Playing test audio")
+
+
+async def text_to_speech(line_text, output_audio_file, voice_template="zh-CN-shaanxi-XiaoniNeural"):
+    # Create an instance of the Communication class
+    # voice_template = "zh-CN-shaanxi-XiaoniNeural"
+    tts = edge_tts.Communicate(line_text, voice=voice_template)
+
+    # Generate temporary audio file for the line
+    temp_file = output_audio_file
+    await tts.save(temp_file)
+
+    return temp_file
+
+@bot.command()
+async def tts(ctx, text, voice_template="zh-CN-shaanxi-XiaoniNeural"):
+    result = await text_to_speech(text, "tts_output.mp3", voice_template)
+    vc = ctx.voice_client
+    source = discord.FFmpegPCMAudio('tts_output.mp3')
+    vc.play(source)
+
+
+async def stop_playing(ctx):
+    if ctx.voice_client and ctx.voice_client.is_playing():
+        ctx.voice_client.stop()  # Stops the current audio
+        await ctx.send("Music stopped!")
+        
+    else:
+        await ctx.send("Nothing is playing right now.")
+        
+
+async def fetch_audio(url):
+    ydl_opts = {
+        'format': 'bestaudio/best',
+        'quiet': True,
+    }
+    # url input from user 
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            print(f"INFO URL IS {info['url']}")
+            return info['url']
+        print("Audio downloaded successfully.")
+    except Exception as e:
+        print(f"An error occurred: {e}")
+    
+@bot.command()
+async def playYoutube(ctx, url):
+    await stop_playing(ctx)
+
+    audio_url = await fetch_audio(url)
+    vc = ctx.voice_client
+    source = discord.FFmpegPCMAudio(audio_url)
+
+    vc.play(source)
+
+@bot.command()
+async def stop(ctx):
+    await stop_playing(ctx)
 
 def save_processed_audio(raw_data, input_sample_rate=44100, input_channels=1, filename="test_audio.pcm"):
 
