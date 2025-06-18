@@ -38,6 +38,9 @@ audio_buffer = queue.Queue()
 # Open microphone stream
 stream = audio.open(format=FORMAT, channels=CHANNELS, rate=RATE, input=True, frames_per_buffer=CHUNK)
 
+music_queues = {}  # guild_id -> asyncio.Queue()
+
+
 @bot.event
 async def on_ready():
     print(f'Logged in as {bot.user}')
@@ -48,16 +51,35 @@ async def ping(ctx):
 
 @bot.command()
 async def join(ctx):
-    print("Received !join command")
-    if ctx.author.voice:
-        channel = ctx.author.voice.channel
-        try:
-            await channel.connect()
-        except Exception as e:
-            print(f"Failed to connect to the voice channel: {e}")
-            await ctx.send("There was an error connecting to the voice channel.")
-    else:
-        await ctx.send("You need to be in a voice channel to use this command!")
+    # 1) Must be in a VC
+    if not ctx.author.voice:
+        return await ctx.send("❌ You need to be in a voice channel first!")
+
+    channel = ctx.author.voice.channel
+
+    # 2) If already connected, disconnect first
+    if ctx.voice_client and ctx.voice_client.is_connected():
+        await ctx.voice_client.disconnect()
+
+    # 3) Try connecting with timeout + no built-in retry
+    try:
+        vc = await channel.connect(timeout=20.0, reconnect=False)
+    except discord.errors.ConnectionClosed as e:
+        # Discord told us our session is invalid (4006) after handshake
+        if getattr(e, 'code', None) == 4006:
+            # Optional: retry once more
+            try:
+                vc = await channel.connect(timeout=20.0, reconnect=False)
+            except Exception:
+                return await ctx.send("⚠️ Voice session expired and reconnect failed. Please try again.")
+        else:
+            return await ctx.send(f"⚠️ Failed to connect to voice channel: {e}")
+    except Exception as e:
+        # Some other error (DNS, permissions, etc)
+        return await ctx.send(f"⚠️ Could not join voice channel: {e}")
+
+    # 4) Success
+    await ctx.send(f"✅ Joined **{vc.channel.name}**!")
 
 @bot.command()
 async def leave(ctx):
@@ -106,10 +128,10 @@ async def play_test_audio(ctx):
     await ctx.send("Playing test audio")
 
 
-async def text_to_speech(line_text, output_audio_file, voice_template="zh-CN-shaanxi-XiaoniNeural"):
+async def text_to_speech(line_text, output_audio_file, voice_template="zh-CN-shaanxi-XiaoniNeural", rate_="+0%"):
     # Create an instance of the Communication class
     # voice_template = "zh-CN-shaanxi-XiaoniNeural"
-    tts = edge_tts.Communicate(line_text, voice=voice_template)
+    tts = edge_tts.Communicate(line_text, voice=voice_template, rate=rate_)
 
     # Generate temporary audio file for the line
     temp_file = output_audio_file
@@ -118,8 +140,8 @@ async def text_to_speech(line_text, output_audio_file, voice_template="zh-CN-sha
     return temp_file
 
 @bot.command()
-async def tts(ctx, text, voice_template="zh-CN-shaanxi-XiaoniNeural"):
-    result = await text_to_speech(text, "tts_output.mp3", voice_template)
+async def tts(ctx, text, voice_template="zh-CN-XiaoyiNeural", rate="+0%"):
+    result = await text_to_speech(text, "tts_output.mp3", voice_template, rate)
     vc = ctx.voice_client
     source = discord.FFmpegPCMAudio('tts_output.mp3')
     vc.play(source)
@@ -151,13 +173,71 @@ async def fetch_audio(url):
     
 @bot.command()
 async def playYoutube(ctx, url):
-    await stop_playing(ctx)
+    guild_id = ctx.guild.id
+    if guild_id not in music_queues:
+        music_queues[guild_id] = asyncio.Queue()
 
-    audio_url = await fetch_audio(url)
+    await music_queues[guild_id].put(url)
+    await ctx.send(f"Added to queue: {url}")
+
+    # Start the player if not already playing
+    if not ctx.voice_client.is_playing():
+        bot.loop.create_task(play_music_queue(ctx))
+
+async def play_music_queue(ctx):
+    guild_id = ctx.guild.id
     vc = ctx.voice_client
-    source = discord.FFmpegPCMAudio(audio_url)
 
-    vc.play(source)
+    while not music_queues[guild_id].empty():
+        url = await music_queues[guild_id].get()
+        audio_url = await fetch_audio(url)
+        source = discord.FFmpegPCMAudio(audio_url)
+
+        def after_playing(error):
+            if error:
+                print(f"Error in after_playing: {error}")
+            # Continue playing next song
+            fut = asyncio.run_coroutine_threadsafe(play_music_queue(ctx), bot.loop)
+            try:
+                fut.result()
+            except Exception as e:
+                print(f"Error running coroutine: {e}")
+
+        vc.play(source, after=after_playing)
+        await ctx.send(f"Now playing: {url}")
+        
+        break  # Break to wait for current song to end (after() will restart this)
+
+@bot.command()
+async def skip(ctx):
+    if ctx.voice_client and ctx.voice_client.is_playing():
+        ctx.voice_client.stop()
+        await ctx.send("Skipped current song!")
+    else:
+        await ctx.send("No song is currently playing.")
+
+@bot.command()
+async def queue(ctx):
+    guild_id = ctx.guild.id
+    if guild_id not in music_queues or music_queues[guild_id].empty():
+        await ctx.send("The music queue is empty!")
+    else:
+        # List the URLs currently in the queue
+        queue_list = list(music_queues[guild_id]._queue)
+        message = "**Current Queue:**\n"
+        for i, url in enumerate(queue_list, start=1):
+            message += f"{i}. {url}\n"
+        await ctx.send(message)
+
+@bot.command()
+async def clear(ctx):
+    guild_id = ctx.guild.id
+
+    if guild_id in music_queues and not music_queues[guild_id].empty():
+        music_queues[guild_id] = asyncio.Queue()  # Just create a new empty queue
+        await ctx.send("Music queue cleared!")
+    else:
+        await ctx.send("The queue is already empty!")
 
 @bot.command()
 async def stop(ctx):
