@@ -1,6 +1,7 @@
 # train_xtts.py
 import os, sys, json, gc, importlib, warnings
 from pathlib import Path
+from typing import Optional, Tuple, List
 
 # Silence the pkg_resources deprecation warning from librosa
 warnings.filterwarnings("ignore", message="pkg_resources is deprecated as an API")
@@ -21,10 +22,10 @@ def _register_safe_globals():
     except Exception:
         return
     candidates = [
-        # Seen in errors and often used by XTTS:
+        # Common XTTS objects seen in checkpoints
         "TTS.tts.configs.xtts_config.XttsConfig",
         "TTS.tts.models.xtts.XttsAudioConfig",
-        # Extra likely configs/types to pre-empt further errors (best-effort):
+        # Extra likely configs/types
         "TTS.tts.configs.shared_configs.BaseAudioConfig",
         "TTS.tts.configs.shared_configs.AudioSettings",
         "TTS.tts.configs.shared_configs.SSLModelConfig",
@@ -71,6 +72,35 @@ def _count_lines(p: Path) -> int:
     with p.open("r", encoding="utf-8") as f:
         return sum(1 for _ in f if _.strip())
 
+def _find_trainer_checkpoints(root: Path) -> List[Path]:
+    """Return parent dirs that contain a Trainer 'checkpoint.pth' file, newest first."""
+    if not root.exists():
+        return []
+    hits = []
+    for p in root.rglob("checkpoint.pth"):
+        try:
+            hits.append(p.parent)
+        except Exception:
+            pass
+    hits.sort(key=lambda d: d.stat().st_mtime, reverse=True)
+    return hits
+
+def _classify_resume_target(p: Path) -> Tuple[Optional[str], Optional[Path]]:
+    """
+    Heuristics:
+      - if directory containing 'checkpoint.pth' => ('trainer', dir)
+      - if file named 'checkpoint.pth'          => ('trainer', dir_of_file)
+      - if file .pth (e.g., export/model.pth)   => ('xtts', file)
+      - else                                    => (None, None)
+    """
+    if p.is_dir() and (p / "checkpoint.pth").exists():
+        return "trainer", p
+    if p.is_file() and p.name == "checkpoint.pth":
+        return "trainer", p.parent
+    if p.is_file() and p.suffix == ".pth":
+        return "xtts", p
+    return None, None
+
 def main():
     cfg_json = _load_json_config()
 
@@ -92,6 +122,11 @@ def main():
     eval_split_max_size = int(cfg_json.get("eval_split_max_size", 64))
     grad_accum         = int(cfg_json.get("grad_accum", cfg_json.get("grad_accum_steps", 1)))
     run_eval           = bool(cfg_json.get("run_eval", True))
+
+    # NEW: resume knobs
+    resume_from         = cfg_json.get("resume_from")  # str or None
+    resume_from_latest  = bool(cfg_json.get("resume_from_latest", False))
+    xtts_ckpt_override  = cfg_json.get("xtts_checkpoint_override")  # str or None
 
     ds_list = cfg_json.get("datasets", [])
     if not ds_list:
@@ -157,6 +192,15 @@ def main():
     MAX_AUDIO = int(cfg_json.get("max_audio_len", 255995))
     MAX_TEXT  = int(cfg_json.get("max_text_len", 200))
 
+    # If user overrides XTTS weights for warm-start, honor it
+    if xtts_ckpt_override:
+        override_p = Path(xtts_ckpt_override)
+        if override_p.exists():
+            ckpt_path = override_p
+            print(f"[resume] Using xtts_checkpoint_override: {ckpt_path}")
+        else:
+            print(f"[resume] xtts_checkpoint_override not found: {override_p} (ignored)")
+
     model_args = GPTArgs(
         max_conditioning_length=264600,
         min_conditioning_length=88200,
@@ -164,7 +208,7 @@ def main():
         max_text_length=MAX_TEXT,
         mel_norm_file=str(mel_path),
         dvae_checkpoint=str(dvae_path),
-        xtts_checkpoint=str(ckpt_path),
+        xtts_checkpoint=str(ckpt_path),  # may be overridden above
         tokenizer_file=str(tok_path),
         gpt_num_audio_tokens=1026,
         gpt_start_audio_token=1024,
@@ -198,7 +242,7 @@ def main():
     tcfg.grad_clip = grad_clip
     tcfg.seed = seed
     tcfg.grad_accum_steps = grad_accum
-    tcfg.run_eval = run_eval  # ← honor JSON / preflight
+    tcfg.run_eval = run_eval  # honor JSON / preflight
 
     if optimizer_name == "adamw":
         tcfg.optimizer = "AdamW"
@@ -214,12 +258,49 @@ def main():
         tcfg.lr_scheduler_params = {"T_max": max(checkpoint_every * 10, 1000), "eta_min": lr * 0.1}
     else:
         tcfg.lr_scheduler = "MultiStepLR"
-        tcfg.lr_scheduler_params = {"milestones": [checkpoint_every*3, checkpoint_every*6, checkpoint_every*9],
-                                    "gamma": 0.5}
+        tcfg.lr_scheduler_params = {
+            "milestones": [checkpoint_every*3, checkpoint_every*6, checkpoint_every*9],
+            "gamma": 0.5
+        }
 
-    # ---- Init model & load samples
+    # ---- Init model (with current config / base or override weights)
     model = GPTTrainer.init_from_config(tcfg)
 
+    # ---- Decide resume target
+    trainer_restore_path: Optional[str] = None
+
+    if resume_from:
+        p = Path(resume_from)
+        kind, target = _classify_resume_target(p)
+        if kind == "trainer":
+            trainer_restore_path = str(target)
+            print(f"[resume] Trainer checkpoint restore: {trainer_restore_path}")
+        elif kind == "xtts":
+            # Replace current XTTS weights with provided file (warm start)
+            try:
+                import torch
+                state = torch.load(str(target), map_location="cpu", weights_only=False)
+                sd = state.get("model", state)
+                if hasattr(model, "xtts") and hasattr(model.xtts, "load_state_dict"):
+                    model.xtts.load_state_dict(sd, strict=False)
+                    print(f"[resume] Loaded XTTS weights from {target} (strict=False)")
+                else:
+                    print("[resume] Warning: model.xtts not found; skipping xtts resume.")
+            except Exception as e:
+                print(f"[resume] Failed to load XTTS .pth: {target} ({e})")
+        else:
+            print(f"[resume] Could not classify resume_from: {p} (ignored)")
+
+    elif resume_from_latest:
+        # Search under out_dir for latest Trainer checkpoint
+        ckpt_dirs = _find_trainer_checkpoints(out_dir)
+        if ckpt_dirs:
+            trainer_restore_path = str(ckpt_dirs[0])
+            print(f"[resume] Auto-picked latest Trainer checkpoint: {trainer_restore_path}")
+        else:
+            print("[resume] resume_from_latest requested but no checkpoints found under output_path.")
+
+    # ---- Load dataset splits
     train_samples, eval_samples = load_tts_samples(
         [dataset_cfg],
         eval_split=tcfg.run_eval,
@@ -227,9 +308,10 @@ def main():
         eval_split_size=tcfg.eval_split_size,
     )
 
+    # ---- Trainer
     trainer = Trainer(
         TrainerArgs(
-            restore_path=None,
+            restore_path=trainer_restore_path,  # <-- resume optimizer/scaler/steps if provided
             start_with_eval=False,
             grad_accum_steps=grad_accum,
         ),
@@ -239,6 +321,8 @@ def main():
         train_samples=train_samples,
         eval_samples=eval_samples if tcfg.run_eval else None,
     )
+
+    # Fit
     trainer.fit()
 
     # --- end-of-run export (always write a final model) ---
@@ -248,11 +332,9 @@ def main():
         export_dir.mkdir(parents=True, exist_ok=True)
         export_ckpt = export_dir / "model.pth"
 
-        # GPTTrainer keeps the XTTS model on `model.xtts`
         xtts_model = getattr(model, "xtts", None)
         if xtts_model is not None:
             torch.save({"model": xtts_model.state_dict()}, export_ckpt)
-            # include config & vocab needed for inference
             shutil.copy2(str(base_dir / "config.json"), export_dir / "config.json")
             shutil.copy2(str(base_dir / "vocab.json"), export_dir / "vocab.json")
             print(f"[export] Wrote {export_ckpt}")

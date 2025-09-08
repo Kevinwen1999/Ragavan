@@ -13,7 +13,7 @@ CFG = {
   "run_eval": False,
   "epochs": 30,
   "optimizer": "adamw",
-  "lr": 5e-5,
+  "lr": 1e-5,
   "grad_clip": 1.0,
   "lr_scheduler": "cosine",
   "mixed_precision": False,
@@ -25,6 +25,7 @@ CFG = {
   "max_audio_len": 330750,
   "max_text_len": 300,
   "language": "zh",
+  "resume_from": "runs/xtts_ft_user/export/model.pth",
 
   "datasets": [
     {

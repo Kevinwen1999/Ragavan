@@ -105,10 +105,7 @@ bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
 # Shared TTS engine + voices
 # tts_engine = TTSEngine()
-tts_engine = TTSEngine(
-    model_path=r"runs\xtts_ft_user\testing",
-    config_path=r"runs\xtts_ft_user\testing\config.json",
-)
+tts_engine = TTSEngine(model_path=r"runs\xtts_ft_user\external\model.pth",config_path=r"runs\xtts_ft_user\external\config.json",)
 voice_profiles = discover_voice_profiles()
 guild_states: Dict[int, GuildState] = {}
 
@@ -245,6 +242,48 @@ async def say(ctx: commands.Context, *, text: str):
                     text=part,
                     speaker_wavs=speaker_wavs,
                     language=get_guild_state(ctx.guild.id).current_lang,  # <— changed
+                )
+                source = discord.FFmpegPCMAudio(
+                    wav_path,
+                    executable=FFMPEG_EXE,
+                    before_options="-nostdin",
+                    options="-vn -f s16le -ar 48000 -ac 2",
+                )
+                vc.play(source)
+                # block until finished
+                while vc.is_playing():
+                    await asyncio.sleep(0.2)
+        except Exception as e:
+            traceback.print_exc()
+            await ctx.reply(f"TTS failed: `{e}`")
+        finally:
+            # Optional: clean up generated files to save disk
+            pass
+
+
+@bot.command(name="inf")
+async def say(ctx: commands.Context, *, text: str):
+    if not text.strip():
+        await ctx.reply("Give me some text, e.g., `!say Hello!`")
+        return
+
+    vc = await ensure_voice(ctx)
+    if not vc:
+        return
+
+    st = get_guild_state(ctx.guild.id)
+    # capture the profile at call time
+    speaker_wavs = voice_profiles.get(st.current_voice) if st.current_voice else None
+
+    # serialize speaking to avoid overlapping audio
+    async with st.speaking_lock:
+        try:
+            parts = chunk_text(text, max_len=450)
+            for i, part in enumerate(parts, 1):
+                wav_path = tts_engine.synthesize_infer(
+                    text=part,
+                    language=get_guild_state(ctx.guild.id).current_lang,  # <— changed
+                    speaker_wav=r"runs\xtts_ft_user\external\test1wav_24000.wav"
                 )
                 source = discord.FFmpegPCMAudio(
                     wav_path,

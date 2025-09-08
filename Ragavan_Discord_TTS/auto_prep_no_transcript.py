@@ -207,14 +207,32 @@ def split_wav(src_path, target_sr=16000):
             outs.append(tmp.name)
     return outs
 
-def transcribe_paths(seg_paths, lang_hint=None, model_size="medium", device=None, compute_type=None, debug=False):
+def batched(seq, n):
+    for i in range(0, len(seq), n):
+        yield seq[i:i+n]
+
+def transcribe_paths(
+    seg_paths,
+    lang_hint=None,
+    model_size="medium",
+    device=None,
+    compute_type=None,
+    debug=False,
+    group_size=64,
+    fallback_on_empty=False,           # new
+    disable_cpu_fallback=False,        # new
+    disable_gpu_quant_fallback=False,  # new
+    min_chars=1                        # new
+):
     from faster_whisper import WhisperModel
+    import gc, traceback, tempfile
+
     use_cuda = torch.cuda.is_available() if device is None else (device == "cuda")
-    prim_device = "cuda" if use_cuda else "cpu"
+    prim_device  = "cuda" if use_cuda else "cpu"
     prim_compute = compute_type or ("float16" if prim_device == "cuda" else "int8")
 
     if debug:
-        print(f"[whisper:init] device={prim_device} compute_type={prim_compute} model={model_size} segments={len(seg_paths)}")
+        print(f"[whisper:init] primary device={prim_device} compute_type={prim_compute} model={model_size} segments={len(seg_paths)} group_size={group_size}")
 
     bad_list_path = Path("bad_segments.txt")
     bad_log = bad_list_path.open("a", encoding="utf-8")
@@ -230,79 +248,116 @@ def transcribe_paths(seg_paths, lang_hint=None, model_size="medium", device=None
             beam_size=5,
             vad_filter=False,
             word_timestamps=False,
-            # safer options if you still see flakes:
-            # temperature=0.0, best_of=1, patience=0
+            # If you still see sporadic runtime errors, uncomment:
+            temperature=0.0, best_of=1, patience=0.1
+            # Also possible:
+            # no_speech_threshold=0.5, log_prob_threshold=-1.0, compression_ratio_threshold=2.6
         )
         txt = " ".join([(s.text or "").strip() for s in segments if (s.text or "").strip()]).strip()
         return txt, getattr(info, "language", None)
 
-    model = new_model(prim_device, prim_compute)
+    def batched(seq, n):
+        for i in range(0, len(seq), n):
+            yield seq[i:i+n]
+
     rows = []
+    processed = 0
 
-    for i, p in enumerate(seg_paths, 1):
-        tried = []
-        def try_decode(path_str, dev, ctype, label):
-            nonlocal model
-            tried.append(label)
+    for gi, group in enumerate(batched(seg_paths, group_size), 1):
+        model = new_model(prim_device, prim_compute)
+
+        for p in group:
+            # Try primary backend; only treat EXCEPTIONS as failure
+            had_error = False
             try:
-                if (dev != prim_device) or (ctype != prim_compute):
-                    # build fresh model on change of backend
-                    del model; gc.collect()
-                    if torch.cuda.is_available(): torch.cuda.empty_cache()
-                    model = new_model(dev, ctype)
-                txt, lang = decode_path(path_str, model, label)
-                return txt, lang
+                txt, lang = decode_path(p, model, f"{prim_device}[{prim_compute}]")
             except Exception as e:
+                had_error = True
                 if debug:
-                    print(f"[asr-error:{label}] {Path(path_str).name}: {e}")
+                    print(f"[asr-error:{prim_device}[{prim_compute}]] {Path(p).name}: {e}")
                     print(traceback.format_exc())
-                return None, None
+                txt, lang = None, None
 
-        # 1) primary attempt
-        txt, lang = try_decode(str(p), prim_device, prim_compute, f"{prim_device}[{prim_compute}]")
-        if not txt:
-            # 2) GPU safer quant
-            if prim_device == "cuda":
-                txt, lang = try_decode(str(p), "cuda", "int8_float16", "cuda[int8_float16]")
-            # 3) CPU int8
-            if not txt:
-                txt, lang = try_decode(str(p), "cpu", "int8", "cpu[int8]")
+            # If we got text but it's shorter than min_chars, consider it empty but NOT an error
+            if txt and len(txt) < min_chars:
+                if debug: print(f"[asr-empty-short] {Path(p).name} len={len(txt)} < {min_chars}")
+                txt = ""
 
-        # 4) sanitize+retry (CPU) if still empty
-        if not txt:
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            # Decide whether to fallback
+            do_fallback = had_error or (fallback_on_empty and not txt)
+
+            if do_fallback:
+                # 1) Safer GPU quant
+                if prim_device == "cuda" and not disable_gpu_quant_fallback:
+                    try:
+                        del model; gc.collect()
+                        if torch.cuda.is_available(): torch.cuda.empty_cache()
+                        model = new_model("cuda", "int8_float16")
+                        txt, lang = decode_path(p, model, "cuda[int8_float16]")
+                        if txt and len(txt) < min_chars:
+                            txt = ""
+                    except Exception as e:
+                        if debug:
+                            print(f"[asr-error:cuda[int8_float16]] {Path(p).name}: {e}")
+                            print(traceback.format_exc())
+                        txt, lang = None, None
+
+                # 2) CPU int8
+                if (not txt) and (not disable_cpu_fallback):
+                    try:
+                        del model; gc.collect()
+                        if torch.cuda.is_available(): torch.cuda.empty_cache()
+                        model = new_model("cpu", "int8")
+                        txt, lang = decode_path(p, model, "cpu[int8]")
+                        if txt and len(txt) < min_chars:
+                            txt = ""
+                    except Exception as e:
+                        if debug:
+                            print(f"[asr-error:cpu[int8]] {Path(p).name}: {e}")
+                            print(traceback.format_exc())
+                        txt, lang = None, None
+
+            # If still nothing AND this started as an error, try sanitize/split on CPU (optional)
+            if (not txt) and had_error and (not disable_cpu_fallback):
                 try:
-                    sanitize_wav(p, tmp.name, target_sr=16000)
-                    txt, lang = try_decode(tmp.name, "cpu", "int8", "cpu[int8]+sanitize")
+                    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                        sanitize_wav(p, tmp.name, target_sr=16000)
+                        del model; gc.collect()
+                        if torch.cuda.is_available(): torch.cuda.empty_cache()
+                        model = new_model("cpu", "int8")
+                        txt, lang = decode_path(tmp.name, model, "cpu[int8]+sanitize")
+                        if txt and len(txt) < min_chars:
+                            txt = ""
                 except Exception as e:
-                    if debug: print(f"[sanitize-fail] {p.name}: {e}")
+                    if debug: print(f"[sanitize-fail] {Path(p).name}: {e}")
 
-        # 5) split+retry (CPU) if still empty
-        if not txt:
-            parts = split_wav(p, target_sr=16000)
-            if parts:
-                texts = []
-                for idx, part in enumerate(parts):
-                    t, _ = try_decode(part, "cpu", "int8", f"cpu[int8]+split{idx}")
-                    if t: texts.append(t)
-                if texts:
-                    txt, lang = " ".join(texts), (lang_hint or "auto")
+            if txt:
+                rows.append((p.stem, txt, lang_hint or (lang or "auto")))
+            else:
+                # No text, but not necessarily an error; just log and continue
+                if debug:
+                    reason = "error" if had_error else "empty"
+                    print(f"[asr-skip:{reason}] {Path(p).name}")
+                if had_error:
+                    bad_log.write(f"{p}\n")
 
-        if txt:
-            rows.append((p.stem, txt, lang_hint or (lang or "auto")))
-        else:
-            # give up on this one
-            bad_log.write(f"{p}\n")
-            if debug:
-                print(f"[asr-skip] {p.name} after retries: {tried}")
+            processed += 1
+            if (processed % 25) == 0 and torch.cuda.is_available():
+                try: torch.cuda.empty_cache()
+                except Exception: pass
 
-        # periodically trim memory
-        if (i % 10) == 0 and torch.cuda.is_available():
+        # end group: tear down model & clear
+        del model; gc.collect()
+        if torch.cuda.is_available():
             try: torch.cuda.empty_cache()
             except Exception: pass
 
+        if debug:
+            print(f"[whisper:group-done] group={gi} processed={processed}")
+
     bad_log.close()
     return rows
+
 
 # ------------- main -------------
 def main():
@@ -317,13 +372,22 @@ def main():
     # Chunking + VAD
     ap.add_argument("--pre_chunk_sec", type=float, default=600.0, help="Chunk length in seconds (default 10 min).")
     ap.add_argument("--pre_chunk_overlap_sec", type=float, default=0.5, help="Overlap between chunks (sec).")
-    ap.add_argument("--vad_aggr", type=int, default=2, help="WebRTC VAD aggressiveness 0-3.")
+    ap.add_argument("--vad_aggr", type=int, default=3, help="WebRTC VAD aggressiveness 0-3.")
     ap.add_argument("--min_sec", type=float, default=1.2, help="Minimum segment length.")
     ap.add_argument("--max_sec", type=float, default=12.0, help="Maximum segment length.")
 
     # Safety caps
     ap.add_argument("--max_segments_per_file", type=int, default=2000, help="Cap segments per source file.")
     ap.add_argument("--max_segments_total", type=int, default=20000, help="Global cap across all files.")
+    ap.add_argument("--asr_group_size", type=int, default=64, help="Transcribe N segments, then rebuild ASR model (prevents long-run flakiness).")
+    ap.add_argument("--fallback_on_empty", action="store_true",
+                help="If set, try fallbacks when transcript is empty. Default: only fallback on ASR errors.")
+    ap.add_argument("--disable_cpu_fallback", action="store_true",
+                    help="Never fall back to CPU; on ASR error, skip the segment.")
+    ap.add_argument("--disable_gpu_quant_fallback", action="store_true",
+                    help="Don’t try cuda[int8_float16] fallback; stay on primary CUDA or skip.")
+    ap.add_argument("--min_chars", type=int, default=1,
+                    help="Skip segments whose transcript text length is below this number.")
 
     ap.add_argument("--debug", action="store_true", help="Verbose logging.")
     args = ap.parse_args()
@@ -408,6 +472,7 @@ def main():
         device=args.device,
         compute_type=args.compute_type,
         debug=args.debug,
+        group_size=args.asr_group_size,   # <-- new
     )
     if not rows:
         print("[stop] No transcripts produced. Try a larger ASR model (e.g. --model_size large-v3) or set --device cpu --compute_type int8.")
