@@ -95,6 +95,20 @@ class GuildState:
     speaking_lock: asyncio.Lock = asyncio.Lock()
     current_lang: str = DEFAULT_LANG
 
+@dataclass
+class UserState:
+    current_voice: Optional[str] = None  # per-user voice key
+    current_lang: str = DEFAULT_LANG     # per-user language
+
+user_states: Dict[int, UserState] = {}
+
+def get_user_state(user_id: int) -> UserState:
+    st = user_states.get(user_id)
+    if not st:
+        st = UserState()
+        user_states[user_id] = st
+    return st
+
 
 # -------------------
 # Bot Setup
@@ -104,8 +118,8 @@ intents.message_content = True  # enable in Dev Portal for your bot
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
 # Shared TTS engine + voices
-# tts_engine = TTSEngine()
-tts_engine = TTSEngine(model_path=r"runs\xtts_ft_user\external\model.pth",config_path=r"runs\xtts_ft_user\external\config.json",)
+tts_engine = TTSEngine()
+# tts_engine = TTSEngine(model_path=r"runs\xtts_ft_user\external\model.pth",config_path=r"runs\xtts_ft_user\external\config.json",)
 voice_profiles = discover_voice_profiles()
 guild_states: Dict[int, GuildState] = {}
 
@@ -181,8 +195,8 @@ async def leave(ctx: commands.Context):
 @bot.command(name="lang")
 async def set_language(ctx: commands.Context, code: Optional[str] = None):
     if not code:
-        st = get_guild_state(ctx.guild.id)
-        return await ctx.reply(f"Current language: **{st.current_lang}**. "
+        st_user = get_user_state(ctx.author.id)
+        return await ctx.reply(f"Your current language: **{st_user.current_lang}**. "
                                f"Try `!lang zh` or `!lang zh-cn`.")
 
     norm = LANG_ALIASES.get(code.lower())
@@ -190,9 +204,9 @@ async def set_language(ctx: commands.Context, code: Optional[str] = None):
         supported = ", ".join(sorted(set(LANG_ALIASES.keys())))
         return await ctx.reply(f"Unsupported code `{code}`. Try one of: {supported}")
 
-    st = get_guild_state(ctx.guild.id)
-    st.current_lang = norm
-    await ctx.reply(f"Language set to **{norm}**.")
+    st_user = get_user_state(ctx.author.id)
+    st_user.current_lang = norm
+    await ctx.reply(f"Your language set to **{norm}**.")
 
 @bot.command(name="voices")
 async def voices(ctx: commands.Context):
@@ -214,9 +228,9 @@ async def setvoice(ctx: commands.Context, name: Optional[str] = None):
     if name_key not in voice_profiles:
         await ctx.reply(f"Voice '{name}' not found. Use `!voices` to see options.")
         return
-    st = get_guild_state(ctx.guild.id)
-    st.current_voice = name_key
-    await ctx.reply(f"Voice set to **{name}**.")
+    st_user = get_user_state(ctx.author.id)
+    st_user.current_voice = name_key
+    await ctx.reply(f"Your voice set to **{name_key}**.")
 
 
 @bot.command(name="say")
@@ -230,8 +244,12 @@ async def say(ctx: commands.Context, *, text: str):
         return
 
     st = get_guild_state(ctx.guild.id)
+    st_user = get_user_state(ctx.author.id)
     # capture the profile at call time
     speaker_wavs = voice_profiles.get(st.current_voice) if st.current_voice else None
+    st_user = get_user_state(ctx.author.id)
+    if getattr(st_user, "current_voice", None):
+        speaker_wavs = voice_profiles.get(st_user.current_voice) or speaker_wavs
 
     # serialize speaking to avoid overlapping audio
     async with st.speaking_lock:
@@ -241,7 +259,7 @@ async def say(ctx: commands.Context, *, text: str):
                 wav_path = tts_engine.synthesize_to_file(
                     text=part,
                     speaker_wavs=speaker_wavs,
-                    language=get_guild_state(ctx.guild.id).current_lang,  # <— changed
+                    language=(get_user_state(ctx.author.id).current_lang if getattr(get_user_state(ctx.author.id), "current_lang", None) else get_guild_state(ctx.guild.id).current_lang),  # <— changed
                 )
                 source = discord.FFmpegPCMAudio(
                     wav_path,
@@ -274,6 +292,9 @@ async def say(ctx: commands.Context, *, text: str):
     st = get_guild_state(ctx.guild.id)
     # capture the profile at call time
     speaker_wavs = voice_profiles.get(st.current_voice) if st.current_voice else None
+    st_user = get_user_state(ctx.author.id)
+    if getattr(st_user, "current_voice", None):
+        speaker_wavs = voice_profiles.get(st_user.current_voice) or speaker_wavs
 
     # serialize speaking to avoid overlapping audio
     async with st.speaking_lock:
@@ -282,7 +303,7 @@ async def say(ctx: commands.Context, *, text: str):
             for i, part in enumerate(parts, 1):
                 wav_path = tts_engine.synthesize_infer(
                     text=part,
-                    language=get_guild_state(ctx.guild.id).current_lang,  # <— changed
+                    language=(get_user_state(ctx.author.id).current_lang if getattr(get_user_state(ctx.author.id), "current_lang", None) else get_guild_state(ctx.guild.id).current_lang),  # <— changed
                     speaker_wav=r"runs\xtts_ft_user\external\test1wav_24000.wav"
                 )
                 source = discord.FFmpegPCMAudio(
