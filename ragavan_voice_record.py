@@ -1,90 +1,104 @@
-from datetime import datetime
 import os
-import wave
+from datetime import datetime
+from pathlib import Path
+
 import discord
-from discord.ext import commands, voice_recv
-import asyncio
-import numpy as np
 from discord.ext import commands
 from dotenv import load_dotenv
 
-
-# Load the environment variables from .env file
 load_dotenv()
+TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 
-# Get the Discord bot token from .env
-TOKEN = os.getenv('DISCORD_BOT_TOKEN')
-
-# Directory to store user audio files
-BASE_DIR = "recordings"
-
+# Where to save WAVs (absolute, next to this script)
+BASE_DIR = Path(__file__).resolve().parent / "recordings_wav"
+BASE_DIR.mkdir(parents=True, exist_ok=True)
 
 bot = commands.Bot(command_prefix="!", intents=discord.Intents.all())
 
-# Dictionary to keep track of user audio files
-audio_files = {}
+# Cache voice clients per guild (as the guide recommends) :contentReference[oaicite:1]{index=1}
+connections = {}
 
-class MySink(voice_recv.AudioSink):
-    def __init__(self):
-        super().__init__()
 
-    def wants_opus(self) -> bool:
-        """Return False to receive PCM (uncompressed) audio, True for Opus."""
-        return False  # Set to True if you want Opus instead of PCM
+def ts() -> str:
+    return datetime.utcnow().strftime("%Y%m%d_%H%M%S")
 
-    def write(self, user, data):
-        """Process the incoming voice data and save it to a file."""
-        user_id = user.id if user else "unknown_user"
-        
-        # Ensure a file is created for each user
-        if user_id not in audio_files:
-            self.create_audio_file(user_id)
-        
-        # Append the PCM data to the user's audio file
-        audio_files[user_id].writeframes(data.pcm)
-    
-    def create_audio_file(self, user_id):
-        """Create a new WAV file in a unique directory for a user to store PCM data."""
-        # Create a directory for the user if it doesn't exist
-        user_dir = os.path.join(BASE_DIR, str(user_id))
-        os.makedirs(user_dir, exist_ok=True)
-        
-        # Create a unique filename with a timestamp to avoid overwriting
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        filename = f"{user_id}_{timestamp}.wav"
-        filepath = os.path.join(user_dir, filename)
-        
-        wf = wave.open(filepath, 'wb')
-        wf.setnchannels(2)  # Stereo channel
-        wf.setsampwidth(2)  # 16-bit audio
-        wf.setframerate(48000)  # 48kHz sample rate
-        audio_files[user_id] = wf
-        print(f"Created audio file for user {user_id}: {filepath}")
 
-    def cleanup(self):
-        """Cleanup after recording is done. Close all open files."""
-        for user_id, wf in audio_files.items():
-            wf.close()
-            print(f"Closed audio file for user {user_id}")
-        audio_files.clear()
+async def once_done(sink: discord.sinks.Sink, channel: discord.TextChannel, *args):
+    """
+    Called automatically when vc.stop_recording() is invoked. :contentReference[oaicite:2]{index=2}
+    Saves separate WAV per user locally.
+    """
+    guild_id = channel.guild.id if channel.guild else 0
+    out_dir = BASE_DIR / str(guild_id)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    saved = []
+    for user_id, audio in sink.audio_data.items():  # per-user audio dict :contentReference[oaicite:3]{index=3}
+        # audio.file is a file-like object (BytesIO or temp file depending on version)
+        out_path = out_dir / f"{user_id}_{ts()}.{sink.encoding}"
+        audio.file.seek(0)
+        with open(out_path, "wb") as f:
+            f.write(audio.file.read())
+        saved.append(str(out_path))
+
+        # Important: close/cleanup per-user audio object if available
+        try:
+            audio.cleanup()
+        except Exception:
+            pass
+
+    # Disconnect after finishing (matches guide behavior) :contentReference[oaicite:4]{index=4}
+    try:
+        await sink.vc.disconnect()
+    except Exception:
+        pass
+
+    if saved:
+        await channel.send(f"Saved {len(saved)} WAV file(s) to: `{out_dir}`")
+    else:
+        await channel.send("Stopped recording, but no user audio was captured (nobody spoke?).")
+
 
 @bot.command()
-async def join(ctx):
-    """Join a voice channel and start recording."""
-    if ctx.author.voice:
-        vc = await ctx.author.voice.channel.connect(cls=voice_recv.VoiceRecvClient)
-        vc.listen(MySink())
+async def record(ctx: commands.Context):
+    voice = ctx.author.voice
+    if not voice or not voice.channel:
+        return await ctx.send("You aren't in a voice channel.")
+
+    # Connect and start recording
+    vc = await voice.channel.connect()
+    connections[ctx.guild.id] = vc
+
+    vc.start_recording(
+        discord.sinks.WaveSink(),  # records WAV per user in sink.audio_data :contentReference[oaicite:5]{index=5}
+        once_done,
+        ctx.channel,
+    )
+    await ctx.send("Started recording. Use `!stop` to stop and save per-user WAVs.")
+
 
 @bot.command()
-async def leave(ctx):
-    """Leave the voice channel."""
-    if ctx.voice_client:
-        ctx.voice_client.stop_listening() 
-        await ctx.voice_client.disconnect()
+async def stop(ctx: commands.Context):
+    vc = connections.get(ctx.guild.id)
+    if not vc:
+        return await ctx.send("I am not recording in this server.")
 
-@bot.event
-async def on_ready():
-    print(f"Logged in as {bot.user.name}")
+    vc.stop_recording()  # triggers once_done callback :contentReference[oaicite:6]{index=6}
+    del connections[ctx.guild.id]
+    await ctx.send("Stopping recording...")
 
-# Run the bot
+
+@bot.command()
+async def leave(ctx: commands.Context):
+    vc = ctx.voice_client
+    if vc:
+        try:
+            if getattr(vc, "recording", False):
+                vc.stop_recording()
+        except Exception:
+            pass
+        await vc.disconnect()
+    await ctx.send("Disconnected.")
+
+
 bot.run(TOKEN)
